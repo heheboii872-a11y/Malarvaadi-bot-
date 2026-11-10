@@ -435,13 +435,20 @@ HELP_COMMAND_GROUPS = {
             "cancelreminder", "repeatremind"
         ]
     },
+    "Welcome & Onboarding": {
+        "emoji": "👋",
+        "description": "Welcome messages, goodbye messages and member onboarding",
+        "commands": [
+            "setwelcome", "setwelcomemessage", "setgoodbye",
+            "setgoodbyemessage", "setautorole", "disableautorole",
+            "setaccountage", "onboarding"
+        ]
+    },
     "Server Management": {
         "emoji": "⚙️",
         "description": "Configure and manage your server",
         "commands": [
-            "setwelcome", "setwelcomemessage", "setgoodbye",
-            "setgoodbyemessage", "setautorole", "disableautorole",
-            "setaccountage", "setmembercounter", "onboarding",
+            "setmembercounter",
             "addreactionrole", "removereactionrole",
             "reactionroles", "setstarboard", "starboardemoji",
             "disablestarboard", "setsticky", "removesticky",
