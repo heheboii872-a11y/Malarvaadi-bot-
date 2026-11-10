@@ -444,6 +444,11 @@ HELP_COMMAND_GROUPS = {
             "setaccountage", "onboarding"
         ]
     },
+    "Logging": {
+        "emoji": "📋",
+        "description": "Server audit logs and member activity.",
+        "commands": ["setlogs", "logs"]
+    },
     "Server Management": {
         "emoji": "⚙️",
         "description": "Configure and manage your server",
@@ -10230,6 +10235,205 @@ async def start_event_scheduler():
 # ============================================================
 # END OF EVENT MANAGEMENT ENGINE
 # ============================================================
+
+
+# ============================================================
+# MALARVAADI GENERAL LOGGING ENGINE
+# ============================================================
+
+async def get_general_log_channel(guild):
+    await bot.db.execute(
+        "INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)",
+        (guild.id,)
+    )
+    await bot.db.commit()
+
+    cursor = await bot.db.execute(
+        "SELECT log_channel FROM guild_config WHERE guild_id = ?",
+        (guild.id,)
+    )
+    row = await cursor.fetchone()
+
+    if not row or not row[0]:
+        return None
+
+    channel = guild.get_channel(row[0])
+    if channel is None:
+        try:
+            channel = await guild.fetch_channel(row[0])
+        except discord.HTTPException:
+            return None
+
+    return channel if isinstance(channel, discord.TextChannel) else None
+
+
+async def send_general_log(guild, embed):
+    channel = await get_general_log_channel(guild)
+    if channel is None:
+        return
+
+    try:
+        await channel.send(
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions.none()
+        )
+    except discord.HTTPException:
+        logger.warning("Could not send a general log in guild %s", guild.id)
+
+
+@bot.hybrid_command(
+    name="setlogs",
+    description="Set the server's general audit-log channel."
+)
+@commands.guild_only()
+@commands.has_permissions(manage_guild=True)
+async def setlogs(ctx, channel: discord.TextChannel):
+    await bot.db.execute(
+        "INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)",
+        (ctx.guild.id,)
+    )
+    await bot.db.execute(
+        "UPDATE guild_config SET log_channel = ? WHERE guild_id = ?",
+        (channel.id, ctx.guild.id)
+    )
+    await bot.db.commit()
+
+    await ctx.send(f"✅ General server logs will be sent to {channel.mention}.")
+
+
+@bot.hybrid_command(
+    name="logs",
+    description="Check or disable the general audit-log system."
+)
+@commands.guild_only()
+@commands.has_permissions(manage_guild=True)
+async def logs(ctx, action: str = "status"):
+    action = action.lower().strip()
+
+    if action == "off":
+        await bot.db.execute(
+            "INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)",
+            (ctx.guild.id,)
+        )
+        await bot.db.execute(
+            "UPDATE guild_config SET log_channel = NULL WHERE guild_id = ?",
+            (ctx.guild.id,)
+        )
+        await bot.db.commit()
+        return await ctx.send("✅ General server logging has been disabled.")
+
+    if action != "status":
+        return await ctx.send("Use `+logs` or `+logs off`.")
+
+    channel = await get_general_log_channel(ctx.guild)
+    if channel is None:
+        return await ctx.send("ℹ️ No general log channel is configured. Use `+setlogs #channel`.")
+
+    await ctx.send(f"📋 General logs are active in {channel.mention}.")
+
+
+# PROFILE PICTURE CHANGES: OLD + NEW AVATAR
+@bot.listen("on_user_update")
+async def malarvaadi_avatar_logging(before, after):
+    if before.avatar == after.avatar:
+        return
+
+    for guild in bot.guilds:
+        member = guild.get_member(after.id)
+        if member is None:
+            continue
+
+        embed = discord.Embed(
+            title="🖼️ Member Profile Picture Changed",
+            description=f"**Member:** {member.mention}\n**User ID:** `{after.id}`",
+            color=discord.Color.blurple(),
+            timestamp=datetime.now(timezone.utc)
+        )
+        embed.add_field(name="Before", value="Previous profile picture", inline=True)
+        embed.add_field(name="After", value="New profile picture", inline=True)
+        embed.set_thumbnail(url=before.display_avatar.replace(size=256).url)
+        embed.set_image(url=after.display_avatar.replace(size=1024).url)
+        embed.set_footer(text="Malarvaadi • Profile Audit")
+
+        await send_general_log(guild, embed)
+
+
+# MEMBER NICKNAME AND ROLE CHANGES
+@bot.listen("on_member_update")
+async def malarvaadi_member_update_logging(before, after):
+    if before.nick != after.nick:
+        embed = discord.Embed(
+            title="✏️ Member Nickname Changed",
+            color=discord.Color.orange(),
+            timestamp=datetime.now(timezone.utc)
+        )
+        embed.add_field(name="Member", value=after.mention, inline=False)
+        embed.add_field(name="Before", value=before.nick or before.name, inline=True)
+        embed.add_field(name="After", value=after.nick or after.name, inline=True)
+        await send_general_log(after.guild, embed)
+
+    before_roles = {role.id: role for role in before.roles if role != before.guild.default_role}
+    after_roles = {role.id: role for role in after.roles if role != after.guild.default_role}
+
+    added = [role.mention for role_id, role in after_roles.items() if role_id not in before_roles]
+    removed = [role.mention for role_id, role in before_roles.items() if role_id not in after_roles]
+
+    if added or removed:
+        embed = discord.Embed(
+            title="🎭 Member Roles Updated",
+            color=discord.Color.blurple(),
+            timestamp=datetime.now(timezone.utc)
+        )
+        embed.add_field(name="Member", value=after.mention, inline=False)
+        if added:
+            embed.add_field(name="Roles Added", value="\n".join(added)[:1024], inline=False)
+        if removed:
+            embed.add_field(name="Roles Removed", value="\n".join(removed)[:1024], inline=False)
+        await send_general_log(after.guild, embed)
+
+
+# MESSAGE EDIT LOGGING
+@bot.listen("on_message_edit")
+async def malarvaadi_message_edit_logging(before, after):
+    if after.guild is None or before.author.bot or before.content == after.content:
+        return
+
+    embed = discord.Embed(
+        title="📝 Message Edited",
+        color=discord.Color.orange(),
+        timestamp=datetime.now(timezone.utc)
+    )
+    embed.add_field(name="Author", value=before.author.mention, inline=True)
+    embed.add_field(name="Channel", value=before.channel.mention, inline=True)
+    embed.add_field(name="Before", value=(before.content or "[No text]")[:1024], inline=False)
+    embed.add_field(name="After", value=(after.content or "[No text]")[:1024], inline=False)
+    embed.add_field(name="Jump to Message", value=f"[Open message]({after.jump_url})", inline=False)
+
+    await send_general_log(after.guild, embed)
+
+
+# MESSAGE DELETE LOGGING
+@bot.listen("on_message_delete")
+async def malarvaadi_message_delete_logging(message):
+    if message.guild is None or message.author.bot:
+        return
+
+    embed = discord.Embed(
+        title="🗑️ Message Deleted",
+        color=discord.Color.red(),
+        timestamp=datetime.now(timezone.utc)
+    )
+    embed.add_field(name="Author", value=message.author.mention, inline=True)
+    embed.add_field(name="Channel", value=message.channel.mention, inline=True)
+    embed.add_field(name="Content", value=(message.content or "[No text content]")[:1024], inline=False)
+
+    await send_general_log(message.guild, embed)
+
+
+# ============================================================
+# END OF MALARVAADI GENERAL LOGGING ENGINE
+# ============================================================
+
 
 if __name__ == "__main__":
 
