@@ -101,6 +101,18 @@ class MalarvaadiBot(commands.Bot):
 
         await initialize_database(self)
 
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS logging_config (
+                guild_id INTEGER NOT NULL,
+                category TEXT NOT NULL,
+                channel_id INTEGER,
+                enabled INTEGER DEFAULT 1,
+                events_json TEXT DEFAULT '{}',
+                PRIMARY KEY (guild_id, category)
+            )
+        """)
+        await self.db.commit()
+
         logger.info("Database initialized.")
 
         await self.tree.sync()
@@ -447,7 +459,7 @@ HELP_COMMAND_GROUPS = {
     "Logging": {
         "emoji": "📋",
         "description": "Server audit logs and member activity.",
-        "commands": ["setlogs", "logs"]
+        "commands": ["setlogs", "logs", "logging"]
     },
     "Server Management": {
         "emoji": "⚙️",
@@ -10267,9 +10279,31 @@ async def get_general_log_channel(guild):
     return channel if isinstance(channel, discord.TextChannel) else None
 
 
-async def send_general_log(guild, embed):
-    channel = await get_general_log_channel(guild)
+async def send_general_log(guild, embed, category="server"):
+    cursor = await bot.db.execute(
+        "SELECT channel_id, enabled FROM logging_config "
+        "WHERE guild_id = ? AND category = ?",
+        (guild.id, category)
+    )
+    config = await cursor.fetchone()
+
+    if config and not config[1]:
+        return
+
+    channel = None
+
+    if config and config[0]:
+        channel = guild.get_channel(config[0])
+        if channel is None:
+            try:
+                channel = await guild.fetch_channel(config[0])
+            except discord.HTTPException:
+                channel = None
+
     if channel is None:
+        channel = await get_general_log_channel(guild)
+
+    if not isinstance(channel, discord.TextChannel):
         return
 
     try:
@@ -10278,7 +10312,10 @@ async def send_general_log(guild, embed):
             allowed_mentions=discord.AllowedMentions.none()
         )
     except discord.HTTPException:
-        logger.warning("Could not send a general log in guild %s", guild.id)
+        logger.warning(
+            "Could not send a %s log in guild %s",
+            category, guild.id
+        )
 
 
 @bot.hybrid_command(
@@ -10332,6 +10369,282 @@ async def logs(ctx, action: str = "status"):
     await ctx.send(f"📋 General logs are active in {channel.mention}.")
 
 
+
+# ============================================================
+# MALARVAADI ADVANCED LOGGING DASHBOARD
+# ============================================================
+
+LOGGING_CATEGORIES = {
+    "members": "Member Logs",
+    "messages": "Message Logs",
+    "voice": "Voice Logs",
+    "profile": "Profile Logs",
+    "server": "Server Logs",
+}
+
+
+async def get_logging_config(guild_id, category):
+    cursor = await bot.db.execute(
+        "SELECT channel_id, enabled FROM logging_config "
+        "WHERE guild_id = ? AND category = ?",
+        (guild_id, category)
+    )
+    return await cursor.fetchone()
+
+
+class LoggingCategorySelect(discord.ui.Select):
+    def __init__(self, dashboard):
+        self.dashboard = dashboard
+        options = [
+            discord.SelectOption(
+                label=label,
+                value=key,
+                emoji="📋"
+            )
+            for key, label in LOGGING_CATEGORIES.items()
+        ]
+        super().__init__(
+            placeholder="Choose a logging category...",
+            options=options,
+            custom_id="malarvaadi_logging_category"
+        )
+
+    async def callback(self, interaction):
+        self.dashboard.category = self.values[0]
+        await interaction.response.edit_message(
+            embed=await self.dashboard.build_embed(),
+            view=self.dashboard
+        )
+
+
+class LoggingChannelSelect(discord.ui.ChannelSelect):
+    def __init__(self, dashboard):
+        self.dashboard = dashboard
+        super().__init__(
+            channel_types=[discord.ChannelType.text],
+            placeholder="Choose a log channel...",
+            min_values=1,
+            max_values=1,
+            custom_id="malarvaadi_logging_channel"
+        )
+
+    async def callback(self, interaction):
+        channel = self.values[0]
+
+        await bot.db.execute(
+            """
+            INSERT INTO logging_config
+                (guild_id, category, channel_id, enabled)
+            VALUES (?, ?, ?, 1)
+            ON CONFLICT(guild_id, category)
+            DO UPDATE SET channel_id = excluded.channel_id
+            """,
+            (
+                interaction.guild.id,
+                self.dashboard.category,
+                channel.id
+            )
+        )
+        await bot.db.commit()
+
+        await interaction.response.edit_message(
+            content=f"✅ {LOGGING_CATEGORIES[self.dashboard.category]} "
+                    f"channel saved: {channel.mention}",
+            embed=await self.dashboard.build_embed(),
+            view=self.dashboard
+        )
+
+
+class MalarvaadiLoggingDashboard(discord.ui.View):
+    def __init__(self, author_id):
+        super().__init__(timeout=300)
+        self.author_id = author_id
+        self.category = "members"
+        self.add_item(LoggingCategorySelect(self))
+        self.add_item(LoggingChannelSelect(self))
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "This logging dashboard belongs to another administrator.",
+                ephemeral=True
+            )
+            return False
+
+        if not interaction.user.guild_permissions.manage_guild:
+            await interaction.response.send_message(
+                "You need Manage Server permission to use this dashboard.",
+                ephemeral=True
+            )
+            return False
+
+        return True
+
+    async def build_embed(self):
+        config = await get_logging_config(
+            self.guild_id,
+            self.category
+        )
+
+        channel_id = config[0] if config else None
+        enabled = bool(config[1]) if config else True
+
+        channel_text = (
+            f"<#{channel_id}>" if channel_id else "Not configured"
+        )
+
+        embed = discord.Embed(
+            title="📋 Malarvaadi Logging Dashboard",
+            description=(
+                "Configure your server's audit-log destinations.\n\n"
+                f"**Selected category:** "
+                f"{LOGGING_CATEGORIES[self.category]}\n"
+                f"**Channel:** {channel_text}\n"
+                f"**Status:** {'🟢 Enabled' if enabled else '🔴 Disabled'}"
+            ),
+            color=COLOR
+        )
+        embed.add_field(
+            name="Available categories",
+            value="Members • Messages • Voice • Profile • Server",
+            inline=False
+        )
+        embed.set_footer(
+            text="Malarvaadi • Logging Control Center"
+        )
+        return embed
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+
+    @discord.ui.button(
+        label="Enable",
+        emoji="🟢",
+        style=discord.ButtonStyle.success,
+        custom_id="malarvaadi_logging_enable"
+    )
+    async def enable_logging(self, interaction, button):
+        await bot.db.execute(
+            """
+            INSERT INTO logging_config
+                (guild_id, category, enabled)
+            VALUES (?, ?, 1)
+            ON CONFLICT(guild_id, category)
+            DO UPDATE SET enabled = 1
+            """,
+            (interaction.guild.id, self.category)
+        )
+        await bot.db.commit()
+
+        await interaction.response.edit_message(
+            content="✅ Category logging enabled.",
+            embed=await self.build_embed(),
+            view=self
+        )
+
+    @discord.ui.button(
+        label="Disable",
+        emoji="🔴",
+        style=discord.ButtonStyle.danger,
+        custom_id="malarvaadi_logging_disable"
+    )
+    async def disable_logging(self, interaction, button):
+        await bot.db.execute(
+            """
+            INSERT INTO logging_config
+                (guild_id, category, enabled)
+            VALUES (?, ?, 0)
+            ON CONFLICT(guild_id, category)
+            DO UPDATE SET enabled = 0
+            """,
+            (interaction.guild.id, self.category)
+        )
+        await bot.db.commit()
+
+        await interaction.response.edit_message(
+            content="🔴 Category logging disabled.",
+            embed=await self.build_embed(),
+            view=self
+        )
+
+    @discord.ui.button(
+        label="Test Log",
+        emoji="🧪",
+        style=discord.ButtonStyle.primary,
+        custom_id="malarvaadi_logging_test"
+    )
+    async def test_logging(self, interaction, button):
+        config = await get_logging_config(
+            interaction.guild.id,
+            self.category
+        )
+
+        if config and not config[1]:
+            return await interaction.response.send_message(
+                "This category is disabled. Enable it before testing.",
+                ephemeral=True
+            )
+
+        channel_id = config[0] if config else None
+        channel = (
+            interaction.guild.get_channel(channel_id)
+            if channel_id else None
+        )
+
+        if channel is None:
+            channel = await get_general_log_channel(interaction.guild)
+
+        if channel is None:
+            return await interaction.response.send_message(
+                "No channel is configured for this category.",
+                ephemeral=True
+            )
+
+        test_embed = discord.Embed(
+            title="🧪 Logging Test",
+            description=(
+                f"Your **{LOGGING_CATEGORIES[self.category]}** "
+                "destination is working."
+            ),
+            color=SUCCESS,
+            timestamp=datetime.now(timezone.utc)
+        )
+        test_embed.set_footer(text="Malarvaadi Logging System")
+
+        try:
+            await channel.send(
+                embed=test_embed,
+                allowed_mentions=discord.AllowedMentions.none()
+            )
+        except discord.HTTPException:
+            return await interaction.response.send_message(
+                "I couldn't send the test log. Check my channel permissions.",
+                ephemeral=True
+            )
+
+        await interaction.response.send_message(
+            f"✅ Test log sent to {channel.mention}.",
+            ephemeral=True
+        )
+
+
+@bot.command(name="logging")
+@commands.guild_only()
+@commands.has_permissions(manage_guild=True)
+async def logging_dashboard(ctx):
+    dashboard = MalarvaadiLoggingDashboard(ctx.author.id)
+    dashboard.guild_id = ctx.guild.id
+
+    await ctx.send(
+        embed=await dashboard.build_embed(),
+        view=dashboard
+    )
+
+# ============================================================
+# END MALARVAADI ADVANCED LOGGING DASHBOARD
+# ============================================================
+
 # PROFILE PICTURE CHANGES: OLD + NEW AVATAR
 @bot.listen("on_user_update")
 async def malarvaadi_avatar_logging(before, after):
@@ -10355,7 +10668,7 @@ async def malarvaadi_avatar_logging(before, after):
         embed.set_image(url=after.display_avatar.replace(size=1024).url)
         embed.set_footer(text="Malarvaadi • Profile Audit")
 
-        await send_general_log(guild, embed)
+        await send_general_log(guild, embed, category='profile')
 
 
 # MEMBER NICKNAME AND ROLE CHANGES
@@ -10370,7 +10683,7 @@ async def malarvaadi_member_update_logging(before, after):
         embed.add_field(name="Member", value=after.mention, inline=False)
         embed.add_field(name="Before", value=before.nick or before.name, inline=True)
         embed.add_field(name="After", value=after.nick or after.name, inline=True)
-        await send_general_log(after.guild, embed)
+        await send_general_log(after.guild, embed, category='members')
 
     before_roles = {role.id: role for role in before.roles if role != before.guild.default_role}
     after_roles = {role.id: role for role in after.roles if role != after.guild.default_role}
@@ -10389,7 +10702,7 @@ async def malarvaadi_member_update_logging(before, after):
             embed.add_field(name="Roles Added", value="\n".join(added)[:1024], inline=False)
         if removed:
             embed.add_field(name="Roles Removed", value="\n".join(removed)[:1024], inline=False)
-        await send_general_log(after.guild, embed)
+        await send_general_log(after.guild, embed, category='members')
 
 
 # MESSAGE EDIT LOGGING
@@ -10409,7 +10722,7 @@ async def malarvaadi_message_edit_logging(before, after):
     embed.add_field(name="After", value=(after.content or "[No text]")[:1024], inline=False)
     embed.add_field(name="Jump to Message", value=f"[Open message]({after.jump_url})", inline=False)
 
-    await send_general_log(after.guild, embed)
+    await send_general_log(after.guild, embed, category='messages')
 
 
 # MESSAGE DELETE LOGGING
@@ -10427,13 +10740,88 @@ async def malarvaadi_message_delete_logging(message):
     embed.add_field(name="Channel", value=message.channel.mention, inline=True)
     embed.add_field(name="Content", value=(message.content or "[No text content]")[:1024], inline=False)
 
-    await send_general_log(message.guild, embed)
+    await send_general_log(message.guild, embed, category='messages')
 
 
 # ============================================================
 # END OF MALARVAADI GENERAL LOGGING ENGINE
 # ============================================================
 
+
+
+# ============================================================
+# MALARVAADI VOICE ACTIVITY LOGGER
+# ============================================================
+
+@bot.listen("on_voice_state_update")
+async def malarvaadi_voice_activity_logger(member, before, after):
+    if member.bot or member.guild is None:
+        return
+
+    changes = []
+
+    if before.channel != after.channel:
+        if before.channel is None and after.channel is not None:
+            changes.append(
+                f"🔊 **Joined voice channel:** {after.channel.mention}"
+            )
+        elif before.channel is not None and after.channel is None:
+            changes.append(
+                f"📴 **Left voice channel:** {before.channel.mention}"
+            )
+        elif before.channel is not None and after.channel is not None:
+            changes.append(
+                f"🔀 **Moved voice channel:** {before.channel.mention} "
+                f"→ {after.channel.mention}"
+            )
+
+    checks = [
+        ("self_mute", "Microphone", "Muted", "Unmuted"),
+        ("mute", "Server mute", "Muted", "Unmuted"),
+        ("self_deaf", "Self deafened", "Deafened", "Undeafened"),
+        ("deaf", "Server deafened", "Deafened", "Undeafened"),
+        ("self_video", "Camera", "Enabled", "Disabled"),
+        ("self_stream", "Screen sharing", "Started", "Stopped"),
+    ]
+
+    for attribute, label, enabled_text, disabled_text in checks:
+        old_value = getattr(before, attribute, False)
+        new_value = getattr(after, attribute, False)
+
+        if old_value != new_value:
+            status = enabled_text if new_value else disabled_text
+            changes.append(f"🎛️ **{label}:** {status}")
+
+    if not changes:
+        return
+
+    embed = discord.Embed(
+        title="🎙️ Voice Activity",
+        description="\n".join(changes),
+        color=COLOR,
+        timestamp=datetime.now(timezone.utc)
+    )
+    embed.add_field(
+        name="Member",
+        value=f"{member.mention}\n`{member.id}`",
+        inline=True
+    )
+    embed.add_field(
+        name="Server",
+        value=member.guild.name,
+        inline=True
+    )
+    embed.set_footer(text="Malarvaadi • Voice Audit")
+
+    await send_general_log(
+        member.guild,
+        embed,
+        category="voice"
+    )
+
+# ============================================================
+# END MALARVAADI VOICE ACTIVITY LOGGER
+# ============================================================
 
 if __name__ == "__main__":
 
