@@ -10823,6 +10823,211 @@ async def malarvaadi_voice_activity_logger(member, before, after):
 # END MALARVAADI VOICE ACTIVITY LOGGER
 # ============================================================
 
+
+
+# ============================================================
+# MALARVAADI SERVER SETUP DASHBOARD
+# ============================================================
+
+class MalarvaadiSetupMessageModal(discord.ui.Modal):
+    def __init__(self, guild_id, column, title):
+        super().__init__(title=title)
+        self.guild_id = guild_id
+        self.column = column
+        self.message = discord.ui.TextInput(
+            label="Message",
+            placeholder="Use {user}, {username}, {server}, {membercount}",
+            style=discord.TextStyle.paragraph,
+            max_length=1800,
+            required=True
+        )
+        self.add_item(self.message)
+
+    async def on_submit(self, interaction):
+        await ensure_onboarding_schema()
+        await bot.db.execute(
+            "INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)",
+            (self.guild_id,)
+        )
+        await bot.db.execute(
+            f"UPDATE guild_config SET {self.column} = ? WHERE guild_id = ?",
+            (str(self.message.value), self.guild_id)
+        )
+        await bot.db.commit()
+        await interaction.response.send_message(
+            "✅ Message saved successfully.", ephemeral=True
+        )
+
+
+class MalarvaadiSetupDashboard(discord.ui.View):
+    def __init__(self, author_id, guild_id):
+        super().__init__(timeout=600)
+        self.author_id = author_id
+        self.guild_id = guild_id
+
+        self.add_item(discord.ui.ChannelSelect(
+            placeholder="Select Welcome Channel",
+            channel_types=[discord.ChannelType.text],
+            custom_id="malarvaadi_setup_welcome"
+        ))
+        self.add_item(discord.ui.ChannelSelect(
+            placeholder="Select Goodbye Channel",
+            channel_types=[discord.ChannelType.text],
+            custom_id="malarvaadi_setup_goodbye"
+        ))
+        self.add_item(discord.ui.RoleSelect(
+            placeholder="Select Automatic Member Role",
+            custom_id="malarvaadi_setup_autorole"
+        ))
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "This dashboard belongs to another user.",
+                ephemeral=True
+            )
+            return False
+        if not interaction.user.guild_permissions.manage_guild:
+            await interaction.response.send_message(
+                "You need Manage Server permission.",
+                ephemeral=True
+            )
+            return False
+        return True
+
+    async def save(self, interaction, column, value, message):
+        await ensure_onboarding_schema()
+        await bot.db.execute(
+            "INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)",
+            (self.guild_id,)
+        )
+        await bot.db.execute(
+            f"UPDATE guild_config SET {column} = ? WHERE guild_id = ?",
+            (value, self.guild_id)
+        )
+        await bot.db.commit()
+        await interaction.response.send_message(
+            f"✅ {message}", ephemeral=True
+        )
+
+    @discord.ui.button(label="Welcome Message", emoji="👋",
+                       style=discord.ButtonStyle.primary, row=3)
+    async def welcome_message(self, interaction, button):
+        await interaction.response.send_modal(
+            MalarvaadiSetupMessageModal(
+                self.guild_id, "welcome_message", "Configure Welcome Message"
+            )
+        )
+
+    @discord.ui.button(label="Goodbye Message", emoji="👋",
+                       style=discord.ButtonStyle.primary, row=3)
+    async def goodbye_message(self, interaction, button):
+        await interaction.response.send_modal(
+            MalarvaadiSetupMessageModal(
+                self.guild_id, "goodbye_message", "Configure Goodbye Message"
+            )
+        )
+
+    @discord.ui.button(label="Toggle Onboarding", emoji="🛡️",
+                       style=discord.ButtonStyle.success, row=4)
+    async def toggle_onboarding(self, interaction, button):
+        await ensure_onboarding_schema()
+        await bot.db.execute(
+            "INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)",
+            (self.guild_id,)
+        )
+        cur = await bot.db.execute(
+            "SELECT onboarding_enabled FROM guild_config WHERE guild_id = ?",
+            (self.guild_id,)
+        )
+        row = await cur.fetchone()
+        new_value = 0 if row and row[0] else 1
+        await bot.db.execute(
+            "UPDATE guild_config SET onboarding_enabled = ? WHERE guild_id = ?",
+            (new_value, self.guild_id)
+        )
+        await bot.db.commit()
+        await interaction.response.send_message(
+            "✅ Onboarding " + ("enabled." if new_value else "disabled."),
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="Refresh", emoji="🔄",
+                       style=discord.ButtonStyle.secondary, row=4)
+    async def refresh(self, interaction, button):
+        await interaction.response.edit_message(
+            embed=await build_malarvaadi_setup_embed(self.guild_id),
+            view=self
+        )
+
+
+async def build_malarvaadi_setup_embed(guild_id):
+    await ensure_onboarding_schema()
+    await bot.db.execute(
+        "INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)",
+        (guild_id,)
+    )
+    cur = await bot.db.execute(
+        """SELECT welcome_channel, goodbye_channel, autorole,
+                  welcome_message, goodbye_message, onboarding_enabled
+           FROM guild_config WHERE guild_id = ?""",
+        (guild_id,)
+    )
+    row = await cur.fetchone()
+    welcome, goodbye, role, welcome_msg, goodbye_msg, onboarding = row
+
+    embed = discord.Embed(
+        title="⚙️ Malarvaadi Server Setup",
+        description="Configure your server using the selectors and buttons below.",
+        color=COLOR
+    )
+    embed.add_field(
+        name="👋 Welcome Channel",
+        value=f"<#{welcome}>" if welcome else "Not configured",
+        inline=True
+    )
+    embed.add_field(
+        name="👋 Goodbye Channel",
+        value=f"<#{goodbye}>" if goodbye else "Not configured",
+        inline=True
+    )
+    embed.add_field(
+        name="🎭 Automatic Role",
+        value=f"<@&{role}>" if role else "Not configured",
+        inline=True
+    )
+    embed.add_field(
+        name="📝 Welcome Message",
+        value="Custom message saved" if welcome_msg else "Default message",
+        inline=True
+    )
+    embed.add_field(
+        name="📝 Goodbye Message",
+        value="Custom message saved" if goodbye_msg else "Default message",
+        inline=True
+    )
+    embed.add_field(
+        name="🛡️ Onboarding",
+        value="Enabled" if onboarding else "Disabled",
+        inline=True
+    )
+    embed.set_footer(text="Malarvaadi • Server Configuration")
+    return embed
+
+
+@bot.command(name="setupdashboard")
+@commands.guild_only()
+@commands.has_permissions(manage_guild=True)
+async def setupdashboard(ctx):
+    view = MalarvaadiSetupDashboard(ctx.author.id, ctx.guild.id)
+    await ctx.send(
+        embed=await build_malarvaadi_setup_embed(ctx.guild.id),
+        view=view
+    )
+
+# ================= END SERVER SETUP DASHBOARD =================
+
+
 if __name__ == "__main__":
 
     try:
